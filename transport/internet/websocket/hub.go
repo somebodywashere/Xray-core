@@ -21,6 +21,7 @@ import (
 )
 
 type requestHandler struct {
+	host string
 	path string
 	ln   *Listener
 }
@@ -37,7 +38,13 @@ var upgrader = &websocket.Upgrader{
 }
 
 func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if len(h.host) > 0 && request.Host != h.host {
+		newError("failed to validate host, request:", request.Host, ", config:", h.host).WriteToLog()
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
 	if request.URL.Path != h.path {
+		newError("failed to validate path, request:", request.URL.Path, ", config:", h.path).WriteToLog()
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -125,6 +132,7 @@ func ListenWS(ctx context.Context, address net.Address, port net.Port, streamSet
 
 	l.server = http.Server{
 		Handler: &requestHandler{
+			host: wsSettings.Host,
 			path: wsSettings.GetNormalizedPath(),
 			ln:   l,
 		},
