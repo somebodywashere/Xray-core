@@ -9,7 +9,7 @@ import (
 
 const (
 	// Size of a regular buffer.
-	Size = 12288
+	Size = 8192
 )
 
 var pool = bytespool.GetPool(Size)
@@ -171,6 +171,14 @@ func (b *Buffer) Check() {
 	if b.start > b.end {
 		b.start = b.end
 	}
+}
+
+// Check valid size.
+func (b *Buffer) CheckExtend(n int32) error {
+	if b.end + n > int32(len(b.v)) {
+		return newError("Extending out of bound")
+	}
+	return nil
 }
 
 // Resize cuts the buffer at the given position.

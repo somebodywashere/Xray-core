@@ -174,9 +174,13 @@ func (c *AEADCipher) EncodePacket(key []byte, b *buf.Buffer) error {
 	ivLen := c.IVSize()
 	payloadLen := b.Len()
 	auth := c.createAuthenticator(key, b.BytesTo(ivLen))
-
-	b.Extend(int32(auth.Overhead()))
-	_, err := auth.Seal(b.BytesTo(ivLen), b.BytesRange(ivLen, payloadLen))
+	overhead := int32(auth.Overhead())
+	err := b.CheckExtend(overhead)
+	if err != nil {
+		return err
+	}
+	b.Extend(overhead)
+	_, err = auth.Seal(b.BytesTo(ivLen), b.BytesRange(ivLen, payloadLen))
 	return err
 }
 
