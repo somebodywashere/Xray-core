@@ -177,7 +177,7 @@ func (b *Buffer) Check() {
 // Check valid size.
 func (b *Buffer) CheckExtend(n int32) error {
 	if b.end + n > int32(len(b.v)) {
-		return newError("Extending out of bound")
+		return errors.New("Extending out of bound")
 	}
 	return nil
 }
