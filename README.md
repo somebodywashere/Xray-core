@@ -4,7 +4,7 @@
 
 [README](https://github.com/XTLS/Xray-core#readme) is open, so feel free to submit your project [here](https://github.com/XTLS/Xray-core/pulls).
 
-## NFTs
+## Donation & NFTs
 
 [Announcement of NFTs by Project X](https://github.com/XTLS/Xray-core/discussions/3633)
 
@@ -21,6 +21,8 @@
 [Project X](https://t.me/projectXray)
 
 [Project X Channel](https://t.me/projectXtls)
+
+[Project VLESS](https://t.me/projectVless) (non-Chinese)
 
 ## Installation
 
@@ -75,6 +77,7 @@
 - Android
   - [v2rayNG](https://github.com/2dust/v2rayNG)
   - [X-flutter](https://github.com/XTLS/X-flutter)
+  - [SaeedDev94/Xray](https://github.com/SaeedDev94/Xray)
 - iOS & macOS arm64
   - [FoXray](https://apps.apple.com/app/foxray/id6448898396)
   - [Streisand](https://apps.apple.com/app/streisand/id6450534064)
