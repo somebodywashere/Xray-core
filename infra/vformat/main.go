@@ -156,6 +156,9 @@ func main() {
 		}
 
 		if info.IsDir() {
+			if path == filepath.Join(pwd, "third_party") || path == filepath.Join(pwd, "build_assets") {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
