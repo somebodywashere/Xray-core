@@ -2,6 +2,8 @@ module github.com/xtls/xray-core
 
 go 1.27
 
+replace github.com/xtls/reality => ./third_party/reality
+
 require (
 	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
 	github.com/ghodss/yaml v1.0.1-0.20220118164431-d8423dcdf344
