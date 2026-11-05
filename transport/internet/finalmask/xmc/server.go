@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/subtle"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +24,8 @@ var (
 )
 
 type serverConn struct {
+	*serverRuntime
+
 	reader io.Reader
 	writer io.Writer
 	c      net.Conn
@@ -34,10 +35,6 @@ type serverConn struct {
 	handshakeLock   sync.Mutex
 	lifecycleMu     sync.Mutex
 	closed          bool
-	profiles        []loginProfile
-	password        string
-	rsaPrivateKey   *rsa.PrivateKey
-	rsaPublicKey    []byte
 	paddingSchedule []paddingTurn
 	packet          *packetStream
 	deadlines       *connectionDeadlines
@@ -142,7 +139,7 @@ func (c *serverConn) handshake() error {
 		if err != nil {
 			return fmt.Errorf("read login start packet: %w", err)
 		}
-		profile, found := findProfile(c.profiles, string(username), uuid)
+		profile, found := c.lookupProfile(string(username), uuid)
 
 		// encrypt request
 
@@ -329,33 +326,25 @@ func (c *serverConn) SetWriteDeadline(t time.Time) error {
 }
 
 func wrapConnServer(c net.Conn, profiles []loginProfile, password string, rsaPrivateKeyDER []byte, rsaPublicKey []byte) (*serverConn, error) {
-	if len(profiles) == 0 {
-		return nil, fmt.Errorf("empty profiles")
-	}
-	if len(rsaPrivateKeyDER) == 0 {
-		return nil, fmt.Errorf("empty rsa private key")
-	}
-	if len(rsaPublicKey) == 0 {
-		return nil, fmt.Errorf("empty rsa public key")
-	}
-	rsaPrivateKey, err := x509.ParsePKCS1PrivateKey(rsaPrivateKeyDER)
+	runtime, err := newServerRuntime(profiles, password, rsaPrivateKeyDER, rsaPublicKey)
 	if err != nil {
-		return nil, fmt.Errorf("parse rsa private key: %w", err)
+		return nil, err
 	}
+	return runtime.wrapConn(c)
+}
+
+func (r *serverRuntime) wrapConn(c net.Conn) (*serverConn, error) {
 	paddingSchedule, err := newServerPaddingSchedule2612()
 	if err != nil {
 		return nil, fmt.Errorf("select padding profile: %w", err)
 	}
 
 	s := &serverConn{
+		serverRuntime:   r,
 		reader:          bufio.NewReader(c),
 		writer:          c,
 		c:               c,
 		state:           serverStateHandshake,
-		profiles:        profiles,
-		password:        password,
-		rsaPrivateKey:   rsaPrivateKey,
-		rsaPublicKey:    rsaPublicKey,
 		paddingSchedule: paddingSchedule,
 		deadlines:       newConnectionDeadlines(c),
 	}

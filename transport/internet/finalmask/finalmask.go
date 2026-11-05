@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -27,6 +28,13 @@ type TCPMask interface {
 	// Listen(net.Listener) (net.Listener, error)
 }
 
+// TCPServerMaskPreparer prepares configuration shared by server connections.
+// FinalMask calls it once per runtime configuration, before opening a listener.
+// The returned mask is used only on the server; DialTCP keeps the original mask.
+type TCPServerMaskPreparer interface {
+	PrepareServer() (TCPMask, error)
+}
+
 type UDPMask interface {
 	WrapPacketConnClient(net.PacketConn, *net.Destination, *Dialer) (net.PacketConn, error)
 	WrapPacketConnServer(net.PacketConn, net.Addr, *ListenConfig) (net.PacketConn, error)
@@ -35,6 +43,9 @@ type UDPMask interface {
 type FinalMask struct {
 	tcpMasks     []TCPMask
 	udpMasks     []UDPMask
+	serverOnce   sync.Once
+	serverMasks  []TCPMask
+	serverErr    error
 	dialTCP      func(context.Context, net.Destination) (net.Conn, error)
 	listen       func(context.Context, net.Addr) (net.Listener, error)
 	dialUDP      func(context.Context, net.Destination) (net.PacketConn, net.Addr, error)
@@ -97,21 +108,49 @@ func (fm *FinalMask) DialTCP(ctx context.Context, dest net.Destination) (net.Con
 	return conn, nil
 }
 
+func (fm *FinalMask) prepareTCPServerMasks() ([]TCPMask, error) {
+	fm.serverOnce.Do(func() {
+		masks := make([]TCPMask, len(fm.tcpMasks))
+		for i, mask := range fm.tcpMasks {
+			if preparer, ok := mask.(TCPServerMaskPreparer); ok {
+				prepared, err := preparer.PrepareServer()
+				if err != nil {
+					fm.serverErr = fmt.Errorf("prepare TCP mask %d: %w", i, err)
+					return
+				}
+				if prepared == nil {
+					fm.serverErr = fmt.Errorf("prepare TCP mask %d: nil mask", i)
+					return
+				}
+				masks[i] = prepared
+			} else {
+				masks[i] = mask
+			}
+		}
+		fm.serverMasks = masks
+	})
+	return fm.serverMasks, fm.serverErr
+}
+
 func (fm *FinalMask) Listen(ctx context.Context, addr net.Addr) (net.Listener, error) {
 	if len(fm.tcpMasks) == 0 {
 		return fm.listen(ctx, addr)
+	}
+	tcpMasks, err := fm.prepareTCPServerMasks()
+	if err != nil {
+		return nil, err
 	}
 	off := 0
 	listener, err := fm.listen(ctx, addr)
 	if err != nil {
 		return nil, err
 	}
-	for i := range fm.tcpMasks {
-		if _, ok := fm.tcpMasks[i].(interface {
+	for i := range tcpMasks {
+		if _, ok := tcpMasks[i].(interface {
 			Listen(net.Listener) (net.Listener, error)
 		}); ok {
 			if i-off == 0 {
-				l, err := fm.tcpMasks[i].(interface {
+				l, err := tcpMasks[i].(interface {
 					Listen(net.Listener) (net.Listener, error)
 				}).Listen(listener)
 				if err != nil {
@@ -120,9 +159,9 @@ func (fm *FinalMask) Listen(ctx context.Context, addr net.Addr) (net.Listener, e
 				}
 				listener = l
 			} else {
-				l, err := fm.tcpMasks[i].(interface {
+				l, err := tcpMasks[i].(interface {
 					Listen(net.Listener) (net.Listener, error)
-				}).Listen(&TCPListener{Listener: listener, tcpMasks: fm.tcpMasks[off:i]})
+				}).Listen(&TCPListener{Listener: listener, tcpMasks: tcpMasks[off:i]})
 				if err != nil {
 					listener.Close()
 					return nil, err
@@ -132,8 +171,8 @@ func (fm *FinalMask) Listen(ctx context.Context, addr net.Addr) (net.Listener, e
 			off = i + 1
 		}
 	}
-	if off < len(fm.tcpMasks) {
-		return &TCPListener{Listener: listener, tcpMasks: fm.tcpMasks[off:]}, nil
+	if off < len(tcpMasks) {
+		return &TCPListener{Listener: listener, tcpMasks: tcpMasks[off:]}, nil
 	}
 	return listener, nil
 }
