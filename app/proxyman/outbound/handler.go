@@ -122,7 +122,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 			if config.Concurrency < 0 {
 				h.mux = &mux.ClientManager{Enabled: false}
 			}
-			if config.Concurrency >= 0 && config.Concurrency <= 128 {
+			if config.Concurrency == 0 {
 				config.Concurrency = 128
 			}
 			if config.Concurrency > 0 {
