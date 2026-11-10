@@ -602,9 +602,31 @@ func masqueIPAddrs(p []byte) (src, dst netip.Addr) {
 	return netip.AddrFrom16([16]byte(p[8:24])), netip.AddrFrom16([16]byte(p[24:40]))
 }
 
+func pickMasqueTCPUDPPort(t *testing.T) net.Port {
+	t.Helper()
+	for range 100 {
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		// H2 and H3 share a port. Check UDP while the TCP port is still held.
+		packetConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.LocalHostIP.IP(), Port: port})
+		if err != nil {
+			listener.Close()
+			continue
+		}
+		packetConn.Close()
+		listener.Close()
+		return net.Port(port)
+	}
+	t.Fatal("could not find a port available for both TCP and UDP")
+	return 0
+}
+
 func TestMasqueServerClientToClient(t *testing.T) {
 	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
-	serverPort := udp.PickPort()
+	serverPort := pickMasqueTCPUDPPort(t)
 	servers, err := InitializeServerConfigs(&core.Config{
 		Inbound: []*core.InboundHandlerConfig{
 			masqueServerInbound(serverPort, tls.ParseCertificate(ct), http3.NextProtoH3, http2.NextProtoTLS),
