@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,9 +15,10 @@ const (
 	configurationServerboundCustomPayload = 0x02
 	configurationKeepAlive                = 0x04
 
-	packetChannel   = "xmc:data"
-	maxPacketData   = 24 * 1024
-	keepAlivePeriod = 15 * time.Second
+	packetChannel       = "xmc:data"
+	maxPacketData       = 24 * 1024
+	keepAlivePeriod     = 15 * time.Second
+	maxKeepAliveReplies = 16
 )
 
 // packetStream carries the raw proxy byte stream in Minecraft configuration
@@ -34,6 +36,14 @@ type packetStream struct {
 	keepAliveID atomic.Int64
 	done        chan struct{}
 	stopOnce    sync.Once
+
+	// Replies must not block the reader when an application upload is stalled.
+	replyOnce sync.Once
+	replies   chan Long
+	replyDone chan struct{}
+	closeConn func() error
+	errorMu   sync.Mutex
+	replyErr  error
 }
 
 func newPacketStream(reader io.Reader, writer io.Writer, isClient bool) *packetStream {
@@ -56,6 +66,9 @@ func (s *packetStream) Read(p []byte) (int, error) {
 
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
+	if err := s.streamError(); err != nil {
+		return 0, err
+	}
 
 	if len(s.pending) > 0 {
 		n := copy(p, s.pending)
@@ -64,8 +77,14 @@ func (s *packetStream) Read(p []byte) (int, error) {
 	}
 
 	for {
+		if err := s.streamError(); err != nil {
+			return 0, err
+		}
 		packet, err := readPacket(s.reader)
 		if err != nil {
+			if stopped := s.streamError(); stopped != nil {
+				return 0, stopped
+			}
 			return 0, fmt.Errorf("read minecraft packet stream: %w", err)
 		}
 
@@ -91,7 +110,7 @@ func (s *packetStream) Read(p []byte) (int, error) {
 				return 0, fmt.Errorf("read minecraft keep-alive: %w", err)
 			}
 			if s.isClient {
-				if err := s.writeKeepAlive(id); err != nil {
+				if err := s.queueKeepAlive(id); err != nil {
 					return 0, err
 				}
 			}
@@ -106,6 +125,9 @@ func (s *packetStream) Write(p []byte) (int, error) {
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.streamError(); err != nil {
+		return 0, err
+	}
 
 	written := 0
 	for written < len(p) {
@@ -116,6 +138,9 @@ func (s *packetStream) Write(p []byte) (int, error) {
 		channel := String(packetChannel)
 		payload := RestBytes(p[written:end])
 		if err := writePacket(s.writer, s.localCustomPayloadID(), &channel, &payload); err != nil {
+			if stopped := s.streamError(); stopped != nil {
+				return written, stopped
+			}
 			return written, fmt.Errorf("write minecraft custom payload: %w", err)
 		}
 		written = end
@@ -126,6 +151,80 @@ func (s *packetStream) Write(p []byte) (int, error) {
 
 func (s *packetStream) Stop() {
 	s.stopOnce.Do(func() { close(s.done) })
+}
+
+func (s *packetStream) streamError() error {
+	if s.isClient {
+		s.errorMu.Lock()
+		err := s.replyErr
+		s.errorMu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	select {
+	case <-s.done:
+		return net.ErrClosed
+	default:
+		return nil
+	}
+}
+
+func (s *packetStream) failKeepAlive(err error) {
+	s.errorMu.Lock()
+	if s.replyErr != nil {
+		s.errorMu.Unlock()
+		return
+	}
+	s.replyErr = err
+	s.errorMu.Unlock()
+	s.Stop()
+	// Closing the owning socket wakes a reader or writer blocked in network I/O.
+	// Do not call the owner's Close method or hold errorMu here.
+	if s.closeConn != nil {
+		_ = s.closeConn()
+	}
+}
+
+func (s *packetStream) queueKeepAlive(id Long) error {
+	if err := s.streamError(); err != nil {
+		return err
+	}
+	s.replyOnce.Do(func() {
+		s.replies = make(chan Long, maxKeepAliveReplies)
+		s.replyDone = make(chan struct{})
+		go s.keepAliveReplyLoop()
+	})
+	select {
+	case <-s.done:
+		return s.streamError()
+	default:
+	}
+	select {
+	case s.replies <- id:
+		return nil
+	case <-s.done:
+		return s.streamError()
+	default:
+		err := fmt.Errorf("too many pending minecraft keep-alive replies")
+		s.failKeepAlive(err)
+		return err
+	}
+}
+
+func (s *packetStream) keepAliveReplyLoop() {
+	defer close(s.replyDone)
+	for {
+		select {
+		case <-s.done:
+			return
+		case id := <-s.replies:
+			if err := s.writeKeepAlive(id); err != nil {
+				s.failKeepAlive(err)
+				return
+			}
+		}
+	}
 }
 
 func (s *packetStream) localCustomPayloadID() int {
@@ -161,6 +260,9 @@ func parseCustomPayload(packet *mcPacket) ([]byte, bool, error) {
 func (s *packetStream) writeKeepAlive(id Long) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := s.streamError(); err != nil {
+		return err
+	}
 	if err := writePacket(s.writer, configurationKeepAlive, &id); err != nil {
 		return fmt.Errorf("write minecraft keep-alive: %w", err)
 	}

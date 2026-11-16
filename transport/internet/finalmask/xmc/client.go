@@ -222,6 +222,7 @@ func (c *clientConn) handshake() error {
 	}
 
 	packet := newPacketStream(c.reader, c.writer, true)
+	packet.closeConn = c.c.Close
 	c.lifecycleMu.Lock()
 	if c.closed {
 		c.lifecycleMu.Unlock()
