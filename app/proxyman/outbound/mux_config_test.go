@@ -95,6 +95,9 @@ func checkMuxStrategy(t *testing.T, name string, manager *mux.ClientManager, wan
 	if !ok {
 		t.Fatalf("%s: unexpected worker factory %T", name, picker.Factory)
 	}
+	if factory.Context == nil || core.FromContext(factory.Context) == nil {
+		t.Fatalf("%s: worker factory lost its core instance context", name)
+	}
 	// Inspect the policy used to allocate real mux workers, not the input config.
 	expected := mux.ClientStrategy{MaxConcurrency: uint32(want), MaxConnection: 1024}
 	if factory.Strategy != expected {

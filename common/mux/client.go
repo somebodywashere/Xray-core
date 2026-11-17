@@ -130,12 +130,19 @@ type ClientWorkerFactory interface {
 }
 
 type DialingWorkerFactory struct {
+	Context  context.Context
 	Proxy    proxy.Outbound
 	Dialer   internet.Dialer
 	Strategy ClientStrategy
 }
 
 func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
+	// A shared worker outlives individual requests, but still needs the
+	// outbound's instance context (for example, its DNS resolver and egress).
+	baseCtx := context.Background()
+	if f.Context != nil {
+		baseCtx = context.WithoutCancel(f.Context)
+	}
 	opts := []pipe.Option{pipe.WithSizeLimit(64 * 1024)}
 	uplinkReader, upLinkWriter := pipe.New(opts...)
 	downlinkReader, downlinkWriter := pipe.New(opts...)
@@ -152,7 +159,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		outbounds := []*session.Outbound{{
 			Target: net.TCPDestination(muxCoolAddress, muxCoolPort),
 		}}
-		ctx := session.ContextWithOutbounds(context.Background(), outbounds)
+		ctx := session.ContextWithOutbounds(baseCtx, outbounds)
 		ctx, cancel := context.WithCancel(ctx)
 
 		if errP := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); errP != nil {
