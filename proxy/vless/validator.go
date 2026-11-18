@@ -26,6 +26,7 @@ func ProcessUUID(id [16]byte) [16]byte {
 
 // MemoryValidator stores valid VLESS users.
 type MemoryValidator struct {
+	mu sync.Mutex
 	// Considering email's usage here, map + sync.Mutex/RWMutex may have better performance.
 	email sync.Map
 	users sync.Map
@@ -33,13 +34,19 @@ type MemoryValidator struct {
 
 // Add a VLESS user, Email must be empty or unique.
 func (v *MemoryValidator) Add(u *protocol.MemoryUser) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	key := ProcessUUID(u.Account.(*MemoryAccount).ID.UUID())
+	if _, exists := v.users.Load(key); exists {
+		return errors.New("duplicate VLESS UUID")
+	}
 	if u.Email != "" {
 		_, loaded := v.email.LoadOrStore(strings.ToLower(u.Email), u)
 		if loaded {
 			return errors.New("User ", u.Email, " already exists.")
 		}
 	}
-	v.users.Store(ProcessUUID(u.Account.(*MemoryAccount).ID.UUID()), u)
+	v.users.Store(key, u)
 	return nil
 }
 
@@ -49,12 +56,14 @@ func (v *MemoryValidator) Del(e string) error {
 		return errors.New("Email must not be empty.")
 	}
 	le := strings.ToLower(e)
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	u, _ := v.email.Load(le)
 	if u == nil {
 		return errors.New("User ", e, " not found.")
 	}
 	v.email.Delete(le)
-	v.users.Delete(ProcessUUID(u.(*protocol.MemoryUser).Account.(*MemoryAccount).ID.UUID()))
+	v.users.CompareAndDelete(ProcessUUID(u.(*protocol.MemoryUser).Account.(*MemoryAccount).ID.UUID()), u)
 	return nil
 }
 

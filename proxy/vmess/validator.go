@@ -37,20 +37,22 @@ func (v *TimedUserValidator) Add(u *protocol.MemoryUser) error {
 	v.Lock()
 	defer v.Unlock()
 
-	v.users = append(v.users, u)
-
 	account, ok := u.Account.(*MemoryAccount)
 	if !ok {
 		return errors.New("account type is incorrect")
 	}
+	var cmdkeyfl [16]byte
+	copy(cmdkeyfl[:], account.ID.CmdKey())
+	if v.aeadDecoderHolder.User(cmdkeyfl) != nil {
+		return errors.New("duplicate VMess ID")
+	}
+	v.users = append(v.users, u)
 	if !v.behaviorFused {
 		hashkdf := hmac.New(sha256.New, []byte("VMESSBSKDF"))
 		hashkdf.Write(account.ID.Bytes())
 		v.behaviorSeed = crc64.Update(v.behaviorSeed, crc64.MakeTable(crc64.ECMA), hashkdf.Sum(nil))
 	}
 
-	var cmdkeyfl [16]byte
-	copy(cmdkeyfl[:], account.ID.CmdKey())
 	v.aeadDecoderHolder.AddUser(cmdkeyfl, u)
 
 	return nil
@@ -91,11 +93,13 @@ func (v *TimedUserValidator) Remove(email string) bool {
 	email = strings.ToLower(email)
 	idx := -1
 	for i, u := range v.users {
-		if strings.EqualFold(u.Email, email) {
+		if strings.ToLower(u.Email) == email {
 			idx = i
 			var cmdkeyfl [16]byte
 			copy(cmdkeyfl[:], u.Account.(*MemoryAccount).ID.CmdKey())
-			v.aeadDecoderHolder.RemoveUser(cmdkeyfl)
+			if v.aeadDecoderHolder.User(cmdkeyfl) == u {
+				v.aeadDecoderHolder.RemoveUser(cmdkeyfl)
+			}
 			break
 		}
 	}

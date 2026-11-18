@@ -1,7 +1,9 @@
 package account
 
 import (
+	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
@@ -40,9 +42,11 @@ func (a *MemoryAccount) ToProto() proto.Message {
 }
 
 type Validator struct {
-	users sync.Map
-	ids   sync.Map
-	mu    sync.Mutex
+	users   sync.Map
+	ids     sync.Map
+	emails  map[string]*protocol.MemoryUser // guarded by mu; email matching is case-sensitive
+	mu      sync.Mutex
+	managed atomic.Bool
 }
 
 func NewValidator() *Validator {
@@ -51,28 +55,46 @@ func NewValidator() *Validator {
 
 func (v *Validator) Add(user *protocol.MemoryUser) (err error) {
 	v.mu.Lock()
-	v.users.Store(user.Account.(*MemoryAccount).Auth, user)
-	if id, err := uuid.Parse(user.Account.(*MemoryAccount).Auth); err == nil {
+	defer v.mu.Unlock()
+	auth := user.Account.(*MemoryAccount).Auth
+	if v.Get(auth) != nil || v.emails[user.Email] != nil {
+		return errors.New("duplicate Hysteria account")
+	}
+	user = user.NewGeneration()
+	v.managed.Store(true)
+	v.users.Store(auth, user)
+	if user.Email != "" {
+		if v.emails == nil {
+			v.emails = make(map[string]*protocol.MemoryUser)
+		}
+		v.emails[user.Email] = user
+	}
+	if id, err := uuid.Parse(auth); err == nil {
 		id[6] = 0
 		id[7] = 0
 		v.ids.Store(id, user)
 	}
-	v.mu.Unlock()
 	return
 }
 
 func (v *Validator) DelByEmail(email string) (err error) {
 	v.mu.Lock()
-	if user := v.GetByEmail(email); user != nil {
-		auth := user.Account.(*MemoryAccount).Auth
-		v.users.Delete(auth)
-		if id, err := uuid.Parse(auth); err == nil {
-			id[6] = 0
-			id[7] = 0
-			v.ids.Delete(id)
-		}
+	user := v.emails[email]
+	if user == nil {
+		v.mu.Unlock()
+		return errors.New("Hysteria user not found")
 	}
+	auth := user.Account.(*MemoryAccount).Auth
+	delete(v.emails, email)
+	v.users.Delete(auth)
+	if id, err := uuid.Parse(auth); err == nil {
+		id[6] = 0
+		id[7] = 0
+		v.ids.Delete(id)
+	}
+	stop := user.Sessions.Revoke()
 	v.mu.Unlock()
+	stop()
 	return
 }
 
@@ -82,8 +104,9 @@ func (v *Validator) Get(auth string) (user *protocol.MemoryUser) {
 			VR := net.PortFromBytes(id[6:8])
 			if user.Account.(*MemoryAccount).VR != VR {
 				user = &protocol.MemoryUser{
-					Email: user.Email,
-					Level: user.Level,
+					Email:    user.Email,
+					Level:    user.Level,
+					Sessions: user.Sessions,
 					Account: &MemoryAccount{
 						Auth: auth,
 						VR:   VR,
@@ -109,6 +132,11 @@ func (v *Validator) GetByID(id uuid.UUID) (user *protocol.MemoryUser) {
 }
 
 func (v *Validator) GetByEmail(email string) (user *protocol.MemoryUser) {
+	if email != "" {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		return v.emails[email]
+	}
 	v.users.Range(func(key, value any) bool {
 		if value.(*protocol.MemoryUser).Email == email {
 			user = value.(*protocol.MemoryUser)
@@ -135,9 +163,15 @@ func (v *Validator) GetCount() (count int64) {
 	return
 }
 
-func (v *Validator) NotEmpty() (not_empty bool) {
-	v.users.Range(func(key, value any) bool {
-		not_empty = true
+// Managed remains true after the last account is removed. Falling back to
+// static transport authentication would reactivate a deleted credential.
+func (v *Validator) Managed() bool {
+	return v.managed.Load()
+}
+
+func (v *Validator) NotEmpty() (notEmpty bool) {
+	v.users.Range(func(_, _ any) bool {
+		notEmpty = true
 		return false
 	})
 	return

@@ -206,6 +206,12 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		return errors.New("invalid protocol or invalid user")
 	}
 
+	ctx, finish, err := user.TrackConnection(ctx, conn)
+	if err != nil {
+		return err
+	}
+	defer finish()
+
 	clientReader := &ConnReader{Reader: bufferedReader}
 	if err := clientReader.ParseHeader(); err != nil {
 		log.Record(&log.AccessMessage{
@@ -327,6 +333,7 @@ func (s *Server) handleConnection(ctx context.Context, sessionPolicy policy.Sess
 ) error {
 	ctx, cancel := context.WithCancel(ctx)
 	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
+	defer timer.SetTimeout(0)
 	ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
 
 	link, err := dispatcher.Dispatch(ctx, destination)

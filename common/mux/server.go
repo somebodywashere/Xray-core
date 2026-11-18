@@ -21,6 +21,7 @@ import (
 
 type Server struct {
 	dispatcher routing.Dispatcher
+	xudp       xudpCache
 }
 
 // NewServer creates a new mux.Server.
@@ -47,11 +48,13 @@ func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*transport
 	uplinkReader, uplinkWriter := pipe.New(opts...)
 	downlinkReader, downlinkWriter := pipe.New(opts...)
 
-	_, err := NewServerWorker(ctx, s.dispatcher, &transport.Link{
+	_, err := s.newWorker(ctx, &transport.Link{
 		Reader: uplinkReader,
 		Writer: downlinkWriter,
 	})
 	if err != nil {
+		uplinkReader.Interrupt()
+		downlinkReader.Interrupt()
 		return nil, err
 	}
 
@@ -63,7 +66,7 @@ func (s *Server) DispatchLink(ctx context.Context, dest net.Destination, link *t
 	if dest.Address != muxCoolAddress {
 		return s.dispatcher.DispatchLink(ctx, dest, link)
 	}
-	worker, err := NewServerWorker(ctx, s.dispatcher, link)
+	worker, err := s.newWorker(ctx, link)
 	if err != nil {
 		return err
 	}
@@ -81,10 +84,12 @@ func (s *Server) Start() error {
 
 // Close implements common.Closable.
 func (s *Server) Close() error {
+	s.xudp.close()
 	return nil
 }
 
 type ServerWorker struct {
+	cache          *xudpCache
 	dispatcher     routing.Dispatcher
 	link           *transport.Link
 	sessionManager *SessionManager
@@ -93,10 +98,15 @@ type ServerWorker struct {
 }
 
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
+	return (&Server{dispatcher: d}).newWorker(ctx, link)
+}
+
+func (s *Server) newWorker(ctx context.Context, link *transport.Link) (*ServerWorker, error) {
 	writer := buf.NewBufferedWriter(link.Writer)
 	writer.SetBuffered(false)
 	worker := &ServerWorker{
-		dispatcher:     d,
+		dispatcher:     s.dispatcher,
+		cache:          &s.xudp,
 		link:           &transport.Link{Reader: link.Reader, Writer: writer},
 		sessionManager: NewSessionManager(),
 		done:           done.New(),
@@ -105,14 +115,26 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		inbound.CanSpliceCopy = 3
 	}
-	go worker.run(ctx)
+	if in := session.InboundFromContext(ctx); in != nil && in.User != nil && in.User.Sessions != nil {
+		release, ok := in.User.Sessions.Track(func() { worker.Close() })
+		if !ok {
+			worker.timer.Stop()
+			return nil, errors.New("account removed")
+		}
+		go func() {
+			defer release()
+			worker.run(ctx)
+		}()
+	} else {
+		go worker.run(ctx)
+	}
 	go worker.monitor()
 	return worker, nil
 }
 
 func handle(ctx context.Context, s *Session, output buf.Writer) {
 	writer := NewResponseWriter(s.ID, output, s.transferType)
-	if err := buf.Copy(s.input, writer); err != nil {
+	if err := buf.Copy(s.reader(), writer); err != nil {
 		errors.LogInfoInner(ctx, err, "session ", s.ID, " ends.")
 		writer.hasError = true
 	}
@@ -183,7 +205,9 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		}
 		if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
 			msg.From = inbound.Source
-			msg.Email = inbound.User.Email
+			if inbound.User != nil {
+				msg.Email = inbound.User.Email
+			}
 		}
 		ctx = log.ContextWithAccessMessage(ctx, msg)
 	}
@@ -194,73 +218,8 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		}
 	}
 
-	if meta.GlobalID != [8]byte{} { // MUST ignore empty Global ID
-		mb, err := NewPacketReader(reader, &meta.Target).ReadMultiBuffer()
-		if err != nil {
-			return err
-		}
-		XUDPManager.Lock()
-		x := XUDPManager.Map[meta.GlobalID]
-		if x == nil {
-			x = &XUDP{GlobalID: meta.GlobalID}
-			XUDPManager.Map[meta.GlobalID] = x
-			XUDPManager.Unlock()
-		} else {
-			if x.Status == Initializing { // nearly impossible
-				XUDPManager.Unlock()
-				errors.LogWarningInner(ctx, errors.New("conflict"), "XUDP hit ", meta.GlobalID)
-				// It's not a good idea to return an err here, so just let client wait.
-				// Client will receive an End frame after sending a Keep frame.
-				return nil
-			}
-			x.Status = Initializing
-			XUDPManager.Unlock()
-			x.Mux.Close(false) // detach from previous Mux
-			b := buf.New()
-			b.Write(mb[0].Bytes())
-			b.UDP = mb[0].UDP
-			if err = x.Mux.output.WriteMultiBuffer(mb); err != nil {
-				x.Interrupt()
-				mb = buf.MultiBuffer{b}
-			} else {
-				b.Release()
-				mb = nil
-			}
-			errors.LogInfoInner(ctx, err, "XUDP hit ", meta.GlobalID)
-		}
-		if mb != nil {
-			ctx = session.ContextWithTimeoutOnly(ctx, true)
-			// Actually, it won't return an error in Xray-core's implementations.
-			link, err := w.dispatcher.Dispatch(ctx, meta.Target)
-			if err != nil {
-				XUDPManager.Lock()
-				delete(XUDPManager.Map, x.GlobalID)
-				XUDPManager.Unlock()
-				err = errors.New("XUDP new ", meta.GlobalID).Base(errors.New("failed to dispatch request to ", meta.Target).Base(err))
-				return err // it will break the whole Mux connection
-			}
-			link.Writer.WriteMultiBuffer(mb) // it's meaningless to test a new pipe
-			x.Mux = &Session{
-				input:  link.Reader,
-				output: link.Writer,
-			}
-			errors.LogInfoInner(ctx, err, "XUDP new ", meta.GlobalID)
-		}
-		x.Mux = &Session{
-			input:        x.Mux.input,
-			output:       x.Mux.output,
-			parent:       w.sessionManager,
-			ID:           meta.SessionID,
-			transferType: protocol.TransferTypePacket,
-			XUDP:         x,
-		}
-		x.Status = Active
-		if !w.sessionManager.Add(x.Mux) {
-			x.Mux.Close(false)
-			return errors.New("failed to add new session")
-		}
-		go handle(ctx, x.Mux, w.link.Writer)
-		return nil
+	if in := session.InboundFromContext(ctx); meta.GlobalID != [8]byte{} && in != nil && in.User != nil {
+		return w.handleXUDP(ctx, in.User, meta, reader)
 	}
 
 	link, err := w.dispatcher.Dispatch(ctx, meta.Target)

@@ -295,12 +295,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 				writer.WriteHeader(http.StatusRequestEntityTooLarge)
 				return
 			}
-			if request.ContentLength > 0 {
-				bodyPayload = make([]byte, request.ContentLength)
-				_, readErr = io.ReadFull(request.Body, bodyPayload)
-			} else {
-				bodyPayload, readErr = buf.ReadAllToBytes(io.LimitReader(request.Body, int64(scMaxEachPostBytes)+1))
-			}
+			bodyPayload, readErr = readUploadBody(currentSession.uploadQueue.ctx, writer, request, scMaxEachPostBytes)
 			if readErr != nil {
 				errors.LogInfoInner(context.Background(), readErr, "failed to read body payload")
 				writer.WriteHeader(http.StatusBadRequest)
@@ -406,8 +401,41 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	}
 }
 
+// A packet-up POST can still be receiving its body when the authenticated
+// downlink closes. Interrupt only that request and finish using its
+// ResponseWriter before ServeHTTP returns.
+func readUploadBody(ctx context.Context, w http.ResponseWriter, r *http.Request, limit int) ([]byte, error) {
+	if r.Body == http.NoBody || r.Body == nil {
+		if r.ContentLength > 0 {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(interrupted)
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		_ = r.Body.Close()
+	})
+	defer func() {
+		if !stop() {
+			<-interrupted
+		}
+	}()
+	if r.ContentLength > 0 {
+		b := make([]byte, r.ContentLength)
+		_, err := io.ReadFull(r.Body, b)
+		return b, err
+	}
+	return buf.ReadAllToBytes(io.LimitReader(r.Body, int64(limit)+1))
+}
+
 type httpServerConn struct {
 	sync.Mutex
+	closeOnce sync.Once
 	*done.Instance
 	io.Reader // no need to Close request.Body
 	http.ResponseWriter
@@ -427,9 +455,17 @@ func (c *httpServerConn) Write(b []byte) (int, error) {
 }
 
 func (c *httpServerConn) Close() error {
-	c.Lock()
-	defer c.Unlock()
-	return c.Instance.Close()
+	c.closeOnce.Do(func() {
+		if !c.TryLock() {
+			// Write or Flush can be waiting for the peer's flow-control
+			// window. Interrupt this response before waiting for its writer.
+			_ = http.NewResponseController(c.ResponseWriter).SetWriteDeadline(time.Now())
+			c.Lock()
+		}
+		defer c.Unlock()
+		c.Instance.Close()
+	})
+	return nil
 }
 
 type Listener struct {

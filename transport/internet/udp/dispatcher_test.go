@@ -88,3 +88,14 @@ func TestSameDestinationDispatching(t *testing.T) {
 		t.Error("msgCount: ", v)
 	}
 }
+
+func TestRemovedDispatcherReleasesIncomingPacket(t *testing.T) {
+	d := NewDispatcher(nil, nil)
+	d.RemoveRay()
+	packet := buf.New()
+	packet.WriteString("in-flight packet")
+	d.Dispatch(t.Context(), net.UDPDestination(net.LocalHostIP, 53), packet)
+	if !packet.IsEmpty() {
+		t.Fatal("a packet rejected after removal was not released")
+	}
+}

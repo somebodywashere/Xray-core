@@ -59,13 +59,22 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 
 		var user *protocol.MemoryUser
 		var ok bool
-		if h.validator != nil && h.validator.NotEmpty() {
+		if h.validator != nil && h.validator.Managed() {
 			user = h.validator.Get(auth)
 		} else if h.config.Auth != "" {
 			ok = auth == h.config.Auth
 		}
 
 		if user != nil || ok {
+			if user != nil {
+				release, active := user.Sessions.Track(func() {
+					_ = h.conn.CloseWithError(closeErrCodeOK, "")
+				})
+				if !active {
+					return false
+				}
+				context.AfterFunc(h.conn.Context(), release)
+			}
 			h.auth = true
 			h.user = user
 
@@ -118,7 +127,10 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *httpHandler) StreamDispatcher(ft http3.FrameType, stream *quic.Stream, err error) (bool, error) {
-	if err != nil || !h.auth {
+	h.Lock()
+	auth, user := h.auth, h.user
+	h.Unlock()
+	if err != nil || !auth {
 		return false, nil
 	}
 
@@ -133,7 +145,7 @@ func (h *httpHandler) StreamDispatcher(ft http3.FrameType, stream *quic.Stream, 
 			local:  h.conn.LocalAddr(),
 			remote: h.conn.RemoteAddr(),
 
-			user: h.user,
+			user: user,
 			lock: make(chan struct{}, 1),
 		})
 		return true, nil

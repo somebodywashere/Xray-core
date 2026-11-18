@@ -2,6 +2,7 @@ package inbound
 
 import (
 	"context"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -179,12 +180,8 @@ type udpConn struct {
 	done             *done.Instance
 	uplink           stats.Counter
 	downlink         stats.Counter
-	inactive         bool
+	ctx              context.Context
 	cancel           context.CancelFunc
-}
-
-func (c *udpConn) setInactive() {
-	c.inactive = true
 }
 
 func (c *udpConn) updateActivity() {
@@ -212,6 +209,9 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
+	if c.done.Done() {
+		return 0, io.ErrClosedPipe
+	}
 	n, err := c.output(buf)
 	if c.downlink != nil {
 		c.downlink.Add(int64(n))
@@ -223,11 +223,9 @@ func (c *udpConn) Write(buf []byte) (int, error) {
 }
 
 func (c *udpConn) Close() error {
-	if c.cancel != nil {
-		c.cancel()
-	}
 	common.Must(c.done.Close())
-	common.Must(common.Close(c.writer))
+	c.cancel()
+	common.Must(common.Interrupt(c.writer))
 	return nil
 }
 
@@ -286,8 +284,11 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 		return conn, true
 	}
 
+	ctx, cancel := context.WithCancel(w.ctx)
 	pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(16*1024))
 	conn := &udpConn{
+		ctx:    ctx,
+		cancel: cancel,
 		reader: pReader,
 		writer: pWriter,
 		output: func(b []byte) (int, error) {
@@ -330,10 +331,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		common.Must(w.checker.Start())
 
 		go func() {
-			ctx, cancel := context.WithCancel(w.ctx)
-			conn.cancel = cancel
-			sid := session.NewID()
-			ctx = c.ContextWithID(ctx, sid)
+			ctx := c.ContextWithID(conn.ctx, session.NewID())
 
 			outbounds := []*session.Outbound{{}}
 			if originalDest.IsValid() {
@@ -362,18 +360,16 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 				errors.LogInfoInner(ctx, err, "connection ends")
 			}
 			conn.Close()
-			// conn not removed by checker TODO may be lock worker here is better
-			if !conn.inactive {
-				conn.setInactive()
-				w.removeConn(id)
-			}
+			w.removeConn(id, conn)
 		}()
 	}
 }
 
-func (w *udpWorker) removeConn(id connID) {
+func (w *udpWorker) removeConn(id connID, conn *udpConn) {
 	w.Lock()
-	delete(w.activeConn, id)
+	if w.activeConn[id] == conn {
+		delete(w.activeConn, id)
+	}
 	w.Unlock()
 }
 
@@ -387,26 +383,26 @@ func (w *udpWorker) handlePackets() {
 func (w *udpWorker) clean() error {
 	nowSec := time.Now().Unix()
 	w.Lock()
-	defer w.Unlock()
-
 	if len(w.activeConn) == 0 {
+		w.Unlock()
 		return errors.New("no more connections. stopping...")
 	}
 
+	var expired []*udpConn
 	for addr, conn := range w.activeConn {
 		if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > 2*60 {
-			if !conn.inactive {
-				conn.setInactive()
-				delete(w.activeConn, addr)
-			}
-			conn.Close()
+			delete(w.activeConn, addr)
+			expired = append(expired, conn)
 		}
 	}
 
 	if len(w.activeConn) == 0 {
 		w.activeConn = make(map[connID]*udpConn, 16)
 	}
-
+	w.Unlock()
+	for _, conn := range expired {
+		conn.Close()
+	}
 	return nil
 }
 

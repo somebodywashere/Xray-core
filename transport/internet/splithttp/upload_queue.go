@@ -5,11 +5,11 @@ package splithttp
 
 import (
 	"container/heap"
+	"context"
 	"io"
 	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/errors"
-	"github.com/xtls/xray-core/common/signal/done"
 )
 
 type Packet struct {
@@ -24,15 +24,18 @@ type uploadQueue struct {
 	heap          uploadHeap
 	nextSeq       uint64
 	maxPackets    int
-	closed        *done.Instance
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 func NewUploadQueue(maxPackets int) *uploadQueue {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &uploadQueue{
 		pushedPackets: make(chan Packet, maxPackets),
 		heap:          uploadHeap{},
 		nextSeq:       0,
-		closed:        done.New(),
+		ctx:           ctx,
+		cancel:        cancel,
 		maxPackets:    maxPackets,
 	}
 }
@@ -43,17 +46,17 @@ func (h *uploadQueue) Push(p Packet) error {
 	}
 	select {
 	case h.pushedPackets <- p: // no panic
-		if h.closed.Done() {
+		if h.ctx.Err() != nil {
 			return errors.New("packet queue closed")
 		}
 		return nil
-	case <-h.closed.Wait():
+	case <-h.ctx.Done():
 		return errors.New("packet queue closed")
 	}
 }
 
 func (h *uploadQueue) Close() error {
-	h.closed.Close()
+	h.cancel()
 	if reader := h.reader.Load(); reader != nil {
 		return reader.Close()
 	}
@@ -65,7 +68,7 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 		return reader.Read(b)
 	}
 
-	if h.closed.Done() {
+	if h.ctx.Err() != nil {
 		return 0, io.EOF
 	}
 
@@ -76,7 +79,7 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 				return p.Reader.Read(b)
 			}
 			heap.Push(&h.heap, p)
-		case <-h.closed.Wait():
+		case <-h.ctx.Done():
 			return 0, io.EOF
 		}
 	}
@@ -112,7 +115,7 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 			select {
 			case p := <-h.pushedPackets:
 				heap.Push(&h.heap, p)
-			case <-h.closed.Wait():
+			case <-h.ctx.Done():
 				return 0, io.EOF
 			}
 		}

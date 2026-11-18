@@ -5,6 +5,7 @@ import (
 	goerrors "errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -24,7 +25,7 @@ type connEntry struct {
 	link   *transport.Link
 	timer  *signal.ActivityTimer
 	cancel context.CancelFunc
-	closed bool
+	closed atomic.Bool
 }
 
 func (c *connEntry) Close() error {
@@ -33,10 +34,7 @@ func (c *connEntry) Close() error {
 }
 
 func (c *connEntry) terminate() {
-	if c.closed {
-		panic("terminate called more than once")
-	}
-	c.closed = true
+	c.closed.Store(true)
 	c.cancel()
 	common.Interrupt(c.link.Reader)
 	common.Interrupt(c.link.Writer)
@@ -60,11 +58,12 @@ func NewDispatcher(dispatcher routing.Dispatcher, callback ResponseCallback) *Di
 
 func (v *Dispatcher) RemoveRay() {
 	v.Lock()
-	defer v.Unlock()
 	v.closed = true
-	if v.conn != nil {
-		v.conn.Close()
-		v.conn = nil
+	conn := v.conn
+	v.conn = nil
+	v.Unlock()
+	if conn != nil {
+		conn.Close()
 	}
 }
 
@@ -77,7 +76,7 @@ func (v *Dispatcher) getInboundRay(ctx context.Context, dest net.Destination) (*
 	}
 
 	if v.conn != nil {
-		if v.conn.closed {
+		if v.conn.closed.Load() {
 			v.conn = nil
 		} else {
 			return v.conn, nil
@@ -111,6 +110,7 @@ func (v *Dispatcher) Dispatch(ctx context.Context, destination net.Destination, 
 
 	conn, err := v.getInboundRay(ctx, destination)
 	if err != nil {
+		payload.Release()
 		errors.LogInfoInner(ctx, err, "failed to get inbound")
 		return
 	}

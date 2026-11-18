@@ -8,6 +8,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/app/dispatcher"
@@ -61,7 +62,7 @@ func init() {
 			if err != nil {
 				return nil, errors.New("failed to get VLESS user").Base(err)
 			}
-			if err := validator.Add(u); err != nil {
+			if err := validator.Add(u.NewGeneration()); err != nil {
 				return nil, errors.New("failed to initiate user").Base(err)
 			}
 		}
@@ -75,6 +76,7 @@ type Handler struct {
 	inboundHandlerManager  feature_inbound.Manager
 	policyManager          policy.Manager
 	stats                  stats.Manager
+	userMu                 sync.Mutex
 	validator              vless.Validator
 	decryption             *encryption.ServerInstance
 	outboundHandlerManager outbound.Manager
@@ -193,34 +195,83 @@ func (h *Handler) GetReverse(a *vless.MemoryAccount) (*Reverse, error) {
 	if u == nil {
 		return nil, errors.New("reverse: user " + a.ID.String() + " doesn't exist anymore")
 	}
-	a = u.Account.(*vless.MemoryAccount)
+	return h.getReverse(h.ctx, u)
+}
+
+func (h *Handler) getReverse(ctx context.Context, u *protocol.MemoryUser) (*Reverse, error) {
+	a := u.Account.(*vless.MemoryAccount)
 	if a.Reverse == nil || a.Reverse.Tag == "" {
 		return nil, errors.New("reverse: user " + a.ID.String() + " is not allowed to create reverse proxy")
 	}
-	r := h.outboundHandlerManager.GetHandler(a.Reverse.Tag)
-	if r == nil {
-		picker, _ := reverse.NewStaticMuxPicker()
-		r = &Reverse{tag: a.Reverse.Tag, picker: picker, client: &mux.ClientManager{Picker: picker}}
-		for len(h.outboundHandlerManager.ListHandlers(h.ctx)) == 0 {
-			time.Sleep(time.Second) // prevents this outbound from becoming the default outbound
+	// A reverse outbound must not become the default outbound.
+	for len(h.outboundHandlerManager.ListHandlers(ctx)) == 0 {
+		if h.validator.Get(a.ID.UUID()) != u {
+			return nil, errors.New("reverse: account removed")
 		}
-		if err := h.outboundHandlerManager.AddHandler(h.ctx, r); err != nil {
-			return nil, err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
 		}
 	}
+	h.userMu.Lock()
+	defer h.userMu.Unlock()
+	if h.validator.Get(a.ID.UUID()) != u {
+		return nil, errors.New("reverse: user " + a.ID.String() + " doesn't exist anymore")
+	}
+	r := h.outboundHandlerManager.GetHandler(a.Reverse.Tag)
+	if r == nil {
+		picker, err := reverse.NewStaticMuxPicker()
+		if err != nil {
+			return nil, err
+		}
+		created := &Reverse{owner: u, tag: a.Reverse.Tag, picker: picker, client: &mux.ClientManager{Picker: picker}}
+		// The manager may independently remove or replace the tag. Keep
+		// the original picker tied to this account's lifetime regardless.
+		release, ok := u.Sessions.Track(func() { picker.Close() })
+		if !ok {
+			picker.Close()
+			return nil, errors.New("reverse: account removed")
+		}
+		created.release = release
+		if err := h.outboundHandlerManager.AddHandler(h.ctx, created); err != nil {
+			created.Close()
+			return nil, err
+		}
+		r = created
+	}
 	if r, ok := r.(*Reverse); ok {
+		if r.owner != u {
+			return nil, errors.New("reverse: tag already belongs to a different user")
+		}
 		return r, nil
 	}
 	return nil, errors.New("reverse: outbound " + a.Reverse.Tag + " is not type Reverse")
 }
 
 func (h *Handler) RemoveReverse(u *protocol.MemoryUser) {
+	if r := h.detachReverse(u); r != nil {
+		r.Close()
+	}
+}
+
+func (h *Handler) detachReverse(u *protocol.MemoryUser) *Reverse {
 	if u != nil {
 		a := u.Account.(*vless.MemoryAccount)
 		if a.Reverse != nil && a.Reverse.Tag != "" {
-			h.outboundHandlerManager.RemoveHandler(h.ctx, a.Reverse.Tag)
+			if r, ok := h.outboundHandlerManager.GetHandler(a.Reverse.Tag).(*Reverse); ok && r.owner == u {
+				if m, ok := h.outboundHandlerManager.(interface {
+					RemoveHandlerIf(string, outbound.Handler)
+				}); ok {
+					m.RemoveHandlerIf(a.Reverse.Tag, r)
+				} else {
+					h.outboundHandlerManager.RemoveHandler(h.ctx, a.Reverse.Tag)
+				}
+				return r
+			}
 		}
 	}
+	return nil
 }
 
 // Close implements common.Closable.Close().
@@ -236,13 +287,27 @@ func (h *Handler) Close() error {
 
 // AddUser implements proxy.UserManager.AddUser().
 func (h *Handler) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
-	return h.validator.Add(u)
+	h.userMu.Lock()
+	defer h.userMu.Unlock()
+	return h.validator.Add(u.NewGeneration())
 }
 
 // RemoveUser implements proxy.UserManager.RemoveUser().
 func (h *Handler) RemoveUser(ctx context.Context, e string) error {
-	h.RemoveReverse(h.validator.GetByEmail(e))
-	return h.validator.Del(e)
+	h.userMu.Lock()
+	u := h.validator.GetByEmail(e)
+	if err := h.validator.Del(e); err != nil {
+		h.userMu.Unlock()
+		return err
+	}
+	stop := u.Sessions.Revoke()
+	r := h.detachReverse(u)
+	h.userMu.Unlock()
+	stop()
+	if r != nil {
+		r.Close()
+	}
+	return nil
 }
 
 // GetUser implements proxy.UserManager.GetUser().
@@ -522,6 +587,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return err
 	}
 
+	ctx, finish, err := request.User.TrackConnection(ctx, connection)
+	if err != nil {
+		return err
+	}
+	defer finish()
+
 	if err := connection.SetReadDeadline(time.Time{}); err != nil {
 		errors.LogWarningInner(ctx, err, "unable to set back read deadline")
 	}
@@ -614,7 +685,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	bufferWriter.SetFlushNext()
 
 	if request.Command == protocol.RequestCommandRvs {
-		r, err := h.GetReverse(account)
+		r, err := h.getReverse(ctx, request.User)
 		if err != nil {
 			return err
 		}
@@ -633,9 +704,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 }
 
 type Reverse struct {
-	tag    string
-	picker *reverse.StaticMuxPicker
-	client *mux.ClientManager
+	owner   *protocol.MemoryUser
+	tag     string
+	picker  *reverse.StaticMuxPicker
+	client  *mux.ClientManager
+	release func()
 }
 
 func (r *Reverse) Tag() string {
@@ -649,6 +722,7 @@ func (r *Reverse) NewMux(ctx context.Context, link *transport.Link, observer fea
 	}
 	worker, err := reverse.NewPortalWorker(muxClient)
 	if err != nil {
+		muxClient.Close()
 		return errors.New("failed to create portal worker").Base(err)
 	}
 	r.picker.AddWorker(worker)
@@ -679,7 +753,9 @@ func (r *Reverse) Start() error {
 }
 
 func (r *Reverse) Close() error {
-	return nil
+	err := r.picker.Close()
+	r.release()
+	return err
 }
 
 func (r *Reverse) SenderSettings() *serial.TypedMessage {

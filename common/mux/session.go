@@ -1,25 +1,21 @@
 package mux
 
 import (
-	"context"
-	"io"
-	"runtime"
 	"sync"
-	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/signal/done"
-	"github.com/xtls/xray-core/transport/pipe"
 )
 
 type SessionManager struct {
 	sync.RWMutex
 	sessions map[uint16]*Session
 	count    uint16
+	wrapped  bool
+	tracked  bool
 	closed   bool
 }
 
@@ -52,17 +48,26 @@ func (m *SessionManager) Count() int {
 }
 
 func (m *SessionManager) Allocate(Strategy *ClientStrategy, input buf.Reader, output buf.Writer) *Session {
+	return m.allocate(Strategy, input, output, false)
+}
+
+func (m *SessionManager) allocate(Strategy *ClientStrategy, input buf.Reader, output buf.Writer, tracked bool) *Session {
 	m.Lock()
 	defer m.Unlock()
 
 	MaxConcurrency := int(Strategy.MaxConcurrency)
 	MaxConnection := uint16(Strategy.MaxConnection)
 
-	if m.closed || (MaxConcurrency > 0 && len(m.sessions) >= MaxConcurrency) || (MaxConnection > 0 && m.count >= MaxConnection) {
+	if tracked {
+		m.tracked = true
+	}
+	if m.closed || m.idSpaceExhausted() || (MaxConcurrency > 0 && len(m.sessions) >= MaxConcurrency) || (MaxConnection > 0 && m.count >= MaxConnection) {
 		return nil
 	}
-
 	m.count++
+	if m.count == 0 {
+		m.wrapped = true
+	}
 	s := &Session{
 		input:  input,
 		output: output,
@@ -74,10 +79,21 @@ func (m *SessionManager) Allocate(Strategy *ClientStrategy, input buf.Reader, ou
 	return s
 }
 
+// End has no peer acknowledgement. On a carrier used by a revocable account
+// an ID must never be reused, even after its End was sent. A legacy carrier
+// that has already wrapped must retire before accepting its first such user.
+// The caller holds the manager lock.
+func (m *SessionManager) idSpaceExhausted() bool {
+	return m.tracked && (m.wrapped || m.count == 0xffff)
+}
+
 func (m *SessionManager) Add(s *Session) bool {
 	m.Lock()
 	defer m.Unlock()
+	return m.add(s)
+}
 
+func (m *SessionManager) add(s *Session) bool {
 	if m.closed {
 		return false
 	}
@@ -139,19 +155,13 @@ func (m *SessionManager) CloseIfNoSessionAndIdle(checkSize int, checkCount int) 
 
 func (m *SessionManager) Close() error {
 	m.Lock()
-	defer m.Unlock()
-
-	if m.closed {
-		return nil
-	}
-
 	m.closed = true
-
-	for _, s := range m.sessions {
-		s.Close(true)
-	}
-
+	sessions := m.sessions
 	m.sessions = nil
+	m.Unlock()
+	for _, s := range sessions {
+		s.Close(false)
+	}
 	return nil
 }
 
@@ -169,37 +179,39 @@ type Session struct {
 
 // Close closes all resources associated with this session.
 func (s *Session) Close(locked bool) error {
+	return s.close(locked, false)
+}
+
+func (s *Session) close(locked, interrupt bool) error {
 	if !locked {
 		s.parent.Lock()
-		defer s.parent.Unlock()
 	}
-	locked = true
 	if s.closed {
+		if !locked {
+			s.parent.Unlock()
+		}
 		return nil
 	}
 	s.closed = true
+	if s.parent.sessions[s.ID] == s {
+		delete(s.parent.sessions, s.ID)
+	}
 	if s.done != nil {
 		s.done.Close()
 	}
-	if s.XUDP == nil {
-		common.Interrupt(s.input)
-		common.Close(s.output)
-	} else {
-		// Stop existing handle(), then trigger writer.Close().
-		// Note that s.output may be dispatcher.SizeStatWriter.
-		s.input.(*pipe.Reader).ReturnAnError(io.EOF)
-		runtime.Gosched()
-		// If the error set by ReturnAnError still exists, clear it.
-		s.input.(*pipe.Reader).Recover()
-		XUDPManager.Lock()
-		if s.XUDP.Status == Active {
-			s.XUDP.Expire = time.Now().Add(time.Minute)
-			s.XUDP.Status = Expiring
-			errors.LogDebug(context.Background(), "XUDP put ", s.XUDP.GlobalID)
-		}
-		XUDPManager.Unlock()
+	if !locked {
+		s.parent.Unlock()
 	}
-	s.parent.Remove(locked, s.ID)
+	if s.XUDP != nil {
+		s.XUDP.detach(s)
+	} else {
+		common.Interrupt(s.input)
+		if interrupt {
+			common.Interrupt(s.output)
+		} else {
+			common.Close(s.output)
+		}
+	}
 	return nil
 }
 
@@ -209,46 +221,4 @@ func (s *Session) NewReader(reader *buf.BufferedReader, dest *net.Destination) b
 		return NewStreamReader(reader)
 	}
 	return NewPacketReader(reader, dest)
-}
-
-const (
-	Initializing = 0
-	Active       = 1
-	Expiring     = 2
-)
-
-type XUDP struct {
-	GlobalID [8]byte
-	Status   uint64
-	Expire   time.Time
-	Mux      *Session
-}
-
-func (x *XUDP) Interrupt() {
-	common.Interrupt(x.Mux.input)
-	common.Close(x.Mux.output)
-}
-
-var XUDPManager struct {
-	sync.Mutex
-	Map map[[8]byte]*XUDP
-}
-
-func init() {
-	XUDPManager.Map = make(map[[8]byte]*XUDP)
-	go func() {
-		for {
-			time.Sleep(time.Minute)
-			now := time.Now()
-			XUDPManager.Lock()
-			for id, x := range XUDPManager.Map {
-				if x.Status == Expiring && now.After(x.Expire) {
-					x.Interrupt()
-					delete(XUDPManager.Map, id)
-					errors.LogDebug(context.Background(), "XUDP del ", id)
-				}
-			}
-			XUDPManager.Unlock()
-		}
-	}()
 }

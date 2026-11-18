@@ -92,6 +92,13 @@ func (a *AuthIDDecoderHolder) AddUser(key [16]byte, ticket interface{}) {
 	a.decoders[string(key[:])] = NewAuthIDDecoderItem(key, ticket)
 }
 
+func (a *AuthIDDecoderHolder) User(key [16]byte) interface{} {
+	if item := a.decoders[string(key[:])]; item != nil {
+		return item.ticket
+	}
+	return nil
+}
+
 func (a *AuthIDDecoderHolder) RemoveUser(key [16]byte) {
 	delete(a.decoders, string(key[:]))
 }

@@ -41,7 +41,6 @@ type MultiUserInbound struct {
 	usersByEmail    *utils.TypedSyncMap[string, *protocol.MemoryUser]
 	userCount       atomic.Int64
 	saltFilter      *antireplay.ReplayFilter[[32]byte]
-	udpSessions     *UDPSessionManager
 	udpMasterCipher cipher.Block
 	policyManager   policy.Manager
 }
@@ -81,7 +80,6 @@ func NewMultiServer(ctx context.Context, config *MultiUserServerConfig) (*MultiU
 		usersByHash:     utils.NewTypedSyncMap[[AESBlockSize]byte, *protocol.MemoryUser](),
 		usersByEmail:    utils.NewTypedSyncMap[string, *protocol.MemoryUser](),
 		saltFilter:      antireplay.NewMapFilter[[32]byte](60),
-		udpSessions:     NewUDPSessionManager(500 * time.Second),
 		udpMasterCipher: masterBlock,
 		policyManager:   v.GetFeature(policy.ManagerType()).(policy.Manager),
 	}
@@ -126,6 +124,13 @@ func (i *MultiUserInbound) AddUser(ctx context.Context, u *protocol.MemoryUser) 
 	}
 
 	pskHash := DeriveUserPSKHash(memAcc.Key)
+	if _, exists := i.usersByHash.Load(pskHash); exists {
+		return errors.New("duplicate Shadowsocks 2022 key")
+	}
+	u = u.NewGeneration()
+	sessions := NewUDPSessionManager(500 * time.Second)
+	sessions.owner = u
+	u.Account = &MemoryAccount{Key: memAcc.Key, udpSessions: sessions}
 	i.usersByHash.Store(pskHash, u)
 	if emailKey != "" {
 		i.usersByEmail.Store(emailKey, u)
@@ -142,18 +147,20 @@ func (i *MultiUserInbound) RemoveUser(ctx context.Context, email string) error {
 	}
 
 	i.Lock()
-	defer i.Unlock()
 
 	emailKey := strings.ToLower(email)
 	u, loaded := i.usersByEmail.LoadAndDelete(emailKey)
 	if !loaded {
+		i.Unlock()
 		return errors.New("user ", email, " not found")
 	}
 
 	pskHash := DeriveUserPSKHash(u.Account.(*MemoryAccount).Key)
 	i.usersByHash.Delete(pskHash)
 	i.userCount.Add(-1)
-
+	stop := u.Sessions.Revoke()
+	i.Unlock()
+	stop()
 	return nil
 }
 
@@ -246,6 +253,11 @@ func (i *MultiUserInbound) processTCP(ctx context.Context, conn net.Conn, dispat
 	// Dispatch Connection to Xray routing with matched User
 	inbound := session.InboundFromContext(ctx)
 	inbound.User = user
+	ctx, finish, err := user.TrackConnection(ctx, conn)
+	if err != nil {
+		return err
+	}
+	defer finish()
 
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 		From:   conn.RemoteAddr(),
@@ -296,45 +308,25 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 			sessionID := binary.BigEndian.Uint64(rawHeader[:8])
 			packetID := binary.BigEndian.Uint64(rawHeader[8:16])
 
-			sessionItem := i.udpSessions.GetOrCreate(sessionID)
+			hash := DecryptUDPEIH(i.udpMasterCipher, rawHeader[:], packetBytes[16:32])
+			user, found := i.usersByHash.Load(hash)
+			if !found {
+				b.Release()
+				continue
+			}
+			acc := user.Account.(*MemoryAccount)
+			sessionItem := acc.udpSessions.GetOrCreate(sessionID)
 
 			if !sessionItem.CheckPacketID(packetID) {
 				b.Release()
 				continue
 			}
 
-			var userPSK []byte
-			var currentUser *protocol.MemoryUser
-			sessionItem.Lock()
-			currentUser = sessionItem.User
-			userPSK = sessionItem.UserPSK
-			sessionItem.Unlock()
-
-			if currentUser == nil {
-				// Decrypt EIH
-				decryptedHash := DecryptUDPEIH(i.udpMasterCipher, rawHeader[:], packetBytes[16:32])
-
-				user, ok := i.usersByHash.Load(decryptedHash)
-				if !ok {
-					b.Release()
-					continue
-				}
-				currentUser = user
-				userPSK = user.Account.(*MemoryAccount).Key
-			}
-
-			decoded, err := sessionItem.DecryptAESPayload(i.method, userPSK, sessionID, packetID, rawHeader[:], packetBytes[32:])
+			decoded, err := sessionItem.DecryptAESPayload(i.method, acc.Key, sessionID, packetID, rawHeader[:], packetBytes[32:])
 			b.Release()
 			if err != nil {
 				continue
 			}
-
-			sessionItem.Lock()
-			if sessionItem.User == nil {
-				sessionItem.User = currentUser
-				sessionItem.UserPSK = userPSK
-			}
-			sessionItem.Unlock()
 
 			link := sessionItem.link.Load()
 			if link != nil {
@@ -342,7 +334,10 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 			} else {
 				var err error
 				link, err = sessionItem.EnsureLink(ctx, conn, decoded.Destination, dispatcher, i.policyManager, func(replyDest net.Destination, payload []byte) ([]byte, error) {
-					return i.encodeServerUDPPacket(sessionID, userPSK, replyDest, payload)
+					if err := sessionItem.EnsureServerState(i.method, acc.Key); err != nil {
+						return nil, err
+					}
+					return sessionItem.EncodeServerPacket(i.method, sessionID, replyDest, payload)
 				})
 				if err != nil {
 					continue
@@ -355,8 +350,4 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 			_ = link.Writer.WriteMultiBuffer(buf.MultiBuffer{pBuf})
 		}
 	}
-}
-
-func (i *MultiUserInbound) encodeServerUDPPacket(clientSessionID uint64, userPSK []byte, dest net.Destination, payload []byte) ([]byte, error) {
-	return i.udpSessions.EncodeServerPacket(i.method, userPSK, clientSessionID, dest, payload)
 }

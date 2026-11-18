@@ -56,7 +56,7 @@ func (v *userByEmail) Add(u *protocol.MemoryUser) bool {
 	return v.addNoLock(u)
 }
 
-func (v *userByEmail) GetOrGenerate(email string) (*protocol.MemoryUser, bool) {
+func (v *userByEmail) getOrGenerate(email string) (*protocol.MemoryUser, bool) {
 	email = strings.ToLower(email)
 
 	v.Lock()
@@ -75,7 +75,7 @@ func (v *userByEmail) GetOrGenerate(email string) (*protocol.MemoryUser, bool) {
 			Email:   email,
 			Account: account,
 		}
-		v.cache[email] = user
+		user = user.NewGeneration()
 	}
 	return user, found
 }
@@ -102,6 +102,7 @@ func (v *userByEmail) Remove(email string) bool {
 
 // Handler is an inbound connection handler that handles messages in VMess protocol.
 type Handler struct {
+	userMu                sync.Mutex
 	policyManager         policy.Manager
 	inboundHandlerManager feature_inbound.Manager
 	clients               *vmess.TimedUserValidator
@@ -148,11 +149,18 @@ func (*Handler) Network() []net.Network {
 }
 
 func (h *Handler) GetOrGenerateUser(email string) *protocol.MemoryUser {
-	user, existing := h.usersByEmail.GetOrGenerate(email)
-	if !existing {
-		h.clients.Add(user)
+	h.userMu.Lock()
+	defer h.userMu.Unlock()
+	for {
+		user, existing := h.usersByEmail.getOrGenerate(email)
+		if existing {
+			return user
+		}
+		if h.clients.Add(user) == nil {
+			h.usersByEmail.Add(user)
+			return user
+		}
 	}
-	return user
 }
 
 func (h *Handler) GetUser(ctx context.Context, email string) *protocol.MemoryUser {
@@ -168,20 +176,36 @@ func (h *Handler) GetUsersCount(context.Context) int64 {
 }
 
 func (h *Handler) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
-	if len(user.Email) > 0 && !h.usersByEmail.Add(user) {
+	h.userMu.Lock()
+	defer h.userMu.Unlock()
+	user = user.NewGeneration()
+	if user.Email != "" && h.usersByEmail.Get(user.Email) != nil {
 		return errors.New("User ", user.Email, " already exists.")
 	}
-	return h.clients.Add(user)
+	if err := h.clients.Add(user); err != nil {
+		return err
+	}
+	if user.Email != "" {
+		h.usersByEmail.Add(user)
+	}
+	return nil
 }
 
 func (h *Handler) RemoveUser(ctx context.Context, email string) error {
 	if email == "" {
 		return errors.New("Email must not be empty.")
 	}
-	if !h.usersByEmail.Remove(email) {
+	h.userMu.Lock()
+	user := h.usersByEmail.Get(email)
+	if user == nil {
+		h.userMu.Unlock()
 		return errors.New("User ", email, " not found.")
 	}
+	h.usersByEmail.Remove(email)
 	h.clients.Remove(email)
+	stop := user.Sessions.Revoke()
+	h.userMu.Unlock()
+	stop()
 	return nil
 }
 
@@ -252,6 +276,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return err
 	}
 
+	ctx, finish, err := request.User.TrackConnection(ctx, connection)
+	if err != nil {
+		return err
+	}
+	defer finish()
+
 	if request.Command != protocol.RequestCommandMux {
 		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 			From:   connection.RemoteAddr(),
@@ -277,6 +307,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	ctx, cancel := context.WithCancel(ctx)
 	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
+	defer timer.SetTimeout(0)
 
 	ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
 	link, err := dispatcher.Dispatch(ctx, request.Destination())

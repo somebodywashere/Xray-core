@@ -2,6 +2,7 @@ package shadowsocks_2022
 
 import (
 	"context"
+	"maps"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -19,7 +20,7 @@ import (
 
 func (s *ServerUDPSession) UpdateConn(conn stat.Connection) {
 	s.currentConn.Store(conn)
-	s.timer.Update()
+	s.timer.Load().Update()
 }
 
 func (s *ServerUDPSession) WriteToClient(b []byte) error {
@@ -36,12 +37,8 @@ func (s *ServerUDPSession) WriteToClient(b []byte) error {
 }
 
 func (s *ServerUDPSession) Close() {
-	if s.timer != nil {
-		s.timer.SetTimeout(0)
-	}
-	if link := s.link.Load(); link != nil {
-		common.Interrupt(link.Reader)
-		common.Interrupt(link.Writer)
+	if timer := s.timer.Load(); timer != nil {
+		timer.SetTimeout(0)
 	}
 }
 
@@ -66,7 +63,17 @@ func (s *ServerUDPSession) EnsureLink(
 	sessCtx, cancel := context.WithCancel(ctx)
 	inbound := session.InboundFromContext(sessCtx)
 	if inbound != nil && s.User != nil {
-		inbound.User = s.User
+		owned := *inbound
+		owned.User = s.User
+		sessCtx = session.ContextWithInbound(sessCtx, &owned)
+	}
+	// One UDP source may carry several owners. Give each routed association
+	// its own mutable destination and sniffing metadata.
+	sessCtx = session.ContextWithOutbounds(sessCtx, nil)
+	if content := session.ContentFromContext(sessCtx); content != nil {
+		owned := *content
+		owned.Attributes = maps.Clone(content.Attributes)
+		sessCtx = session.ContextWithContent(sessCtx, &owned)
 	}
 	var email string
 	var level uint32
@@ -88,16 +95,32 @@ func (s *ServerUDPSession) EnsureLink(
 	}
 
 	sessionPolicy := policyManager.ForLevel(level)
-	s.timer = signal.CancelAfterInactivity(sessCtx, func() {
+	timer := signal.CancelAfterInactivity(sessCtx, func() {
 		if s.manager != nil {
-			s.manager.Delete(s.SessionID)
+			s.manager.sessions.CompareAndDelete(s.SessionID, s)
 		}
-		s.Close()
 		cancel()
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
 	}, sessionPolicy.Timeouts.ConnectionIdle)
+	s.timer.Store(timer)
+	var release func()
+	if s.User != nil && s.User.Sessions != nil {
+		var active bool
+		release, active = s.User.Sessions.Track(s.Close)
+		if !active {
+			s.Close()
+			return nil, errors.New("Shadowsocks UDP account was removed")
+		}
+	}
 	s.link.Store(link)
 
-	go handleUDPResponse(s, link, dest, responseEncoder)
+	go func() {
+		if release != nil {
+			defer release()
+		}
+		handleUDPResponse(s, link, dest, responseEncoder)
+	}()
 	return link, nil
 }
 
@@ -111,13 +134,14 @@ func ResetTCPConn(conn net.Conn) {
 }
 
 func handleUDPResponse(s *ServerUDPSession, link *transport.Link, fallbackDest net.Destination, encode func(dest net.Destination, payload []byte) ([]byte, error)) {
-	defer s.timer.SetTimeout(0)
+	timer := s.timer.Load()
+	defer timer.SetTimeout(0)
 	for {
 		resMb, err := link.Reader.ReadMultiBuffer()
 		if err != nil {
 			return
 		}
-		s.timer.Update()
+		timer.Update()
 		for i, rb := range resMb {
 			b := rb.Bytes()
 			if encode != nil {

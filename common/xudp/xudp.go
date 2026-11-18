@@ -68,6 +68,11 @@ func GetGlobalID(ctx context.Context) (globalID [8]byte) {
 	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.Network == net.Network_UDP &&
 		(inbound.Name == "dokodemo-door" || inbound.Name == "socks" || inbound.Name == "shadowsocks" || inbound.Name == "tun") {
+		// The next hop authenticates our shared outbound credentials. Its
+		// parked flow could outlive (or cross) the local account generation.
+		if inbound.User != nil && inbound.User.Sessions != nil {
+			return
+		}
 		h := blake3.New(8, ensureBaseKey())
 		h.Write([]byte(inbound.Source.String()))
 		copy(globalID[:], h.Sum(nil))

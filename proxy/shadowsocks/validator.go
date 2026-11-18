@@ -7,6 +7,7 @@ import (
 	"hash/crc64"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
@@ -16,7 +17,9 @@ import (
 // Validator stores valid Shadowsocks users.
 type Validator struct {
 	sync.RWMutex
-	users []*protocol.MemoryUser
+	users  []*protocol.MemoryUser
+	emails map[string]struct{}
+	keys   map[cipherKey]struct{}
 
 	behaviorSeed  uint64
 	behaviorFused bool
@@ -24,14 +27,59 @@ type Validator struct {
 
 var ErrNotFound = errors.New("Not Found")
 
+type cipherKey struct {
+	method CipherType
+	key    string
+}
+
+// Canonical member of each Unicode simple-fold class, as used by strings.EqualFold.
+func foldedEmail(email string) string {
+	return strings.Map(func(r rune) rune {
+		for {
+			next := unicode.SimpleFold(r)
+			if next <= r {
+				return next
+			}
+			r = next
+		}
+	}, email)
+}
+
 // Add a Shadowsocks user.
 func (v *Validator) Add(u *protocol.MemoryUser) error {
 	v.Lock()
 	defer v.Unlock()
 
 	account := u.Account.(*MemoryAccount)
-	if !account.Cipher.IsAEAD() && len(v.users) > 0 {
-		return errors.New("The cipher is not support Single-port Multi-user")
+	if len(v.users) != 0 {
+		first := v.users[0]
+		firstAccount := first.Account.(*MemoryAccount)
+		if !firstAccount.Cipher.IsAEAD() || !account.Cipher.IsAEAD() {
+			return errors.New("multi-user Shadowsocks requires AEAD")
+		}
+		// UDP uses a short-lived, single-user validator for subsequent packets.
+		// Build the indexes only when this validator actually becomes multi-user.
+		if v.keys == nil {
+			v.emails = make(map[string]struct{})
+			if first.Email != "" {
+				v.emails[foldedEmail(first.Email)] = struct{}{}
+			}
+			v.keys = map[cipherKey]struct{}{{firstAccount.CipherType, string(firstAccount.Key)}: {}}
+		}
+	}
+	if v.keys != nil {
+		email := foldedEmail(u.Email)
+		if _, exists := v.emails[email]; exists {
+			return errors.New("duplicate user email: ", u.Email)
+		}
+		key := cipherKey{account.CipherType, string(account.Key)}
+		if _, exists := v.keys[key]; exists {
+			return errors.New("duplicate Shadowsocks credentials")
+		}
+		if email != "" {
+			v.emails[email] = struct{}{}
+		}
+		v.keys[key] = struct{}{}
 	}
 	v.users = append(v.users, u)
 
@@ -51,9 +99,7 @@ func (v *Validator) Del(email string) error {
 	}
 
 	v.Lock()
-	defer v.Unlock()
 
-	email = strings.ToLower(email)
 	idx := -1
 	for i, u := range v.users {
 		if strings.EqualFold(u.Email, email) {
@@ -63,14 +109,23 @@ func (v *Validator) Del(email string) error {
 	}
 
 	if idx == -1 {
+		v.Unlock()
 		return errors.New("User ", email, " not found.")
 	}
 	ulen := len(v.users)
+	stop := v.users[idx].Sessions.Revoke()
+	if v.keys != nil {
+		u := v.users[idx]
+		a := u.Account.(*MemoryAccount)
+		delete(v.emails, foldedEmail(u.Email))
+		delete(v.keys, cipherKey{a.CipherType, string(a.Key)})
+	}
 
 	v.users[idx] = v.users[ulen-1]
 	v.users[ulen-1] = nil
 	v.users = v.users[:ulen-1]
-
+	v.Unlock()
+	stop()
 	return nil
 }
 
@@ -83,7 +138,6 @@ func (v *Validator) GetByEmail(email string) *protocol.MemoryUser {
 	v.Lock()
 	defer v.Unlock()
 
-	email = strings.ToLower(email)
 	for _, u := range v.users {
 		if strings.EqualFold(u.Email, email) {
 			return u

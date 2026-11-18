@@ -52,4 +52,6 @@ type MemoryUser struct {
 	Account Account
 	Email   string
 	Level   uint32
+	// Sessions belongs to one registration in one inbound validator.
+	Sessions *UserSessions
 }

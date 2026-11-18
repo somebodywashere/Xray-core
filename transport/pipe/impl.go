@@ -89,7 +89,16 @@ func (p *pipe) readMultiBufferInternal() (buf.MultiBuffer, error) {
 }
 
 func (p *pipe) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	return p.readMultiBufferUntil(nil)
+}
+
+func (p *pipe) readMultiBufferUntil(stop <-chan struct{}) (buf.MultiBuffer, error) {
 	for {
+		select {
+		case <-stop:
+			return nil, io.EOF
+		default:
+		}
 		data, err := p.readMultiBufferInternal()
 		if data != nil || err != nil {
 			p.writeSignal.Signal()
@@ -99,6 +108,8 @@ func (p *pipe) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		select {
 		case <-p.readSignal.Wait():
 		case <-p.done.Wait():
+		case <-stop:
+			return nil, io.EOF
 		case err = <-p.errChan:
 			return nil, err
 		}
@@ -125,9 +136,14 @@ func (p *pipe) ReadMultiBufferTimeout(d time.Duration) (buf.MultiBuffer, error) 
 	}
 }
 
-func (p *pipe) writeMultiBufferInternal(mb buf.MultiBuffer) error {
+func (p *pipe) writeMultiBufferInternal(mb buf.MultiBuffer, stop <-chan struct{}) error {
 	p.Lock()
 	defer p.Unlock()
+	select {
+	case <-stop:
+		return io.ErrClosedPipe
+	default:
+	}
 
 	if err := p.getState(false); err != nil {
 		return err
@@ -142,12 +158,16 @@ func (p *pipe) writeMultiBufferInternal(mb buf.MultiBuffer) error {
 }
 
 func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return p.writeMultiBufferUntil(mb, nil)
+}
+
+func (p *pipe) writeMultiBufferUntil(mb buf.MultiBuffer, stop <-chan struct{}) error {
 	if mb.IsEmpty() {
 		return nil
 	}
 
 	for {
-		err := p.writeMultiBufferInternal(mb)
+		err := p.writeMultiBufferInternal(mb, stop)
 		if err == nil {
 			p.readSignal.Signal()
 			return nil
@@ -161,6 +181,9 @@ func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			select {
 			case <-p.writeSignal.Wait():
 				continue
+			case <-stop:
+				buf.ReleaseMulti(mb)
+				return io.ErrClosedPipe
 			case <-p.done.Wait():
 				buf.ReleaseMulti(mb)
 				return io.ErrClosedPipe

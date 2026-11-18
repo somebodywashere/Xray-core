@@ -10,20 +10,27 @@ import (
 
 // Validator stores valid trojan users.
 type Validator struct {
-	// Considering email's usage here, map + sync.Mutex/RWMutex may have better performance.
+	mu    sync.Mutex
 	email sync.Map
 	users sync.Map
 }
 
 // Add a trojan user, Email must be empty or unique.
 func (v *Validator) Add(u *protocol.MemoryUser) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	key := hexString(u.Account.(*MemoryAccount).Key)
+	if _, exists := v.users.Load(key); exists {
+		return errors.New("duplicate Trojan credential")
+	}
+	u = u.NewGeneration()
 	if u.Email != "" {
 		_, loaded := v.email.LoadOrStore(strings.ToLower(u.Email), u)
 		if loaded {
 			return errors.New("User ", u.Email, " already exists.")
 		}
 	}
-	v.users.Store(hexString(u.Account.(*MemoryAccount).Key), u)
+	v.users.Store(key, u)
 	return nil
 }
 
@@ -33,12 +40,17 @@ func (v *Validator) Del(e string) error {
 		return errors.New("Email must not be empty.")
 	}
 	le := strings.ToLower(e)
-	u, _ := v.email.Load(le)
+	v.mu.Lock()
+	u, _ := v.email.LoadAndDelete(le)
 	if u == nil {
+		v.mu.Unlock()
 		return errors.New("User ", e, " not found.")
 	}
-	v.email.Delete(le)
-	v.users.Delete(hexString(u.(*protocol.MemoryUser).Account.(*MemoryAccount).Key))
+	user := u.(*protocol.MemoryUser)
+	v.users.CompareAndDelete(hexString(user.Account.(*MemoryAccount).Key), user)
+	stop := user.Sessions.Revoke()
+	v.mu.Unlock()
+	stop()
 	return nil
 }
 

@@ -16,6 +16,11 @@ func (r *Reader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	return r.pipe.ReadMultiBuffer()
 }
 
+// ReadMultiBufferUntil reads from the pipe until this consumer detaches.
+func (r *Reader) ReadMultiBufferUntil(stop <-chan struct{}) (buf.MultiBuffer, error) {
+	return r.pipe.readMultiBufferUntil(stop)
+}
+
 // ReadMultiBufferTimeout reads content from a pipe within the given duration, or returns buf.ErrTimeout otherwise.
 func (r *Reader) ReadMultiBufferTimeout(d time.Duration) (buf.MultiBuffer, error) {
 	return r.pipe.ReadMultiBufferTimeout(d)

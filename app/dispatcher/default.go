@@ -263,6 +263,35 @@ func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResu
 	return false
 }
 
+// Bind the routed operation to the authenticated registration. Dispatch owns
+// both pipes; DispatchLink borrows protocol-specific I/O whose socket is
+// already tracked by the inbound. Never close a borrowed codec concurrently.
+func trackDispatch(ctx context.Context, pipes *transport.Link) (context.Context, func(), error) {
+	in := session.InboundFromContext(ctx)
+	if in == nil || in.User == nil || in.User.Sessions == nil {
+		return ctx, func() {}, nil
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	stop := cancel
+	if pipes != nil {
+		reader, writer := pipes.Reader, pipes.Writer
+		stop = func() {
+			cancel()
+			common.Interrupt(reader)
+			common.Interrupt(writer)
+		}
+	}
+	release, ok := in.User.Sessions.Track(stop)
+	if !ok {
+		stop()
+		return ctx, nil, errors.New("account removed")
+	}
+	return ctx, func() {
+		release()
+		cancel()
+	}, nil
+}
+
 // Dispatch implements routing.Dispatcher.
 func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*transport.Link, error) {
 	if !destination.IsValid() {
@@ -284,10 +313,18 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 
 	sniffingRequest := content.SniffingRequest
 	inbound, outbound := d.getLink(ctx)
+	ctx, finish, err := trackDispatch(ctx, outbound)
+	if err != nil {
+		return nil, err
+	}
 	if !sniffingRequest.Enabled {
-		go d.routedDispatch(ctx, outbound, destination)
+		go func() {
+			defer finish()
+			d.routedDispatch(ctx, outbound, destination)
+		}()
 	} else {
 		go func() {
+			defer finish()
 			cReader := &cachedReader{
 				reader: outbound.Reader.(*pipe.Reader),
 			}
@@ -325,6 +362,11 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	if !destination.IsValid() {
 		return errors.New("Dispatcher: Invalid destination.")
 	}
+	ctx, finish, err := trackDispatch(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer finish()
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		outbounds = []*session.Outbound{{}}
@@ -488,6 +530,11 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 		return
 	}
 
+	// Route selection may block after admission. In particular, a pooled
+	// outbound can start a request without ever doing a cancellable dial.
+	if in := session.InboundFromContext(ctx); in != nil && in.User != nil && in.User.Sessions.Revoked() {
+		return
+	}
 	ob.Tag = handler.Tag()
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
 		if tag := handler.Tag(); tag != "" {

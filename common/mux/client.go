@@ -188,9 +188,7 @@ var (
 
 // NewClientWorker creates a new mux.Client.
 func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
-	writer := buf.NewBufferedWriter(stream.Writer)
-	writer.SetBuffered(false)
-	stream.Writer = writer
+	stream.Writer = &clientFrameWriter{writer: stream.Writer, gate: make(chan struct{}, 1)}
 	c := &ClientWorker{
 		sessionManager: NewSessionManager(),
 		link:           stream,
@@ -259,7 +257,7 @@ func writeFirstPayload(reader buf.Reader, writer *Writer) error {
 	return nil
 }
 
-func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
+func fetchInput(ctx context.Context, s *Session, output *clientFrameWriter, tracked bool) {
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	transferType := protocol.TransferTypeStream
@@ -271,9 +269,23 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	if session.IsReverseMuxFromContext(ctx) {
 		inbound = session.InboundFromContext(ctx)
 	}
-	writer := NewWriter(s.ID, ob.Target, output, transferType, xudp.GetGlobalID(ctx), inbound)
+	var frameOutput buf.Writer = output
+	var flow trackedFrameWriter
+	if tracked {
+		flow = trackedFrameWriter{carrier: output, stop: ctx.Done()}
+		frameOutput = &flow
+	}
+	writer := NewWriter(s.ID, ob.Target, frameOutput, transferType, xudp.GetGlobalID(ctx), inbound)
 	defer s.Close(false)
-	defer writer.Close()
+	defer func() {
+		if !tracked {
+			writer.Close()
+			return
+		}
+		if flow.sent && writer.Close() != nil && ctx.Err() != nil {
+			output.endLater(s.ID)
+		}
+	}()
 
 	errors.LogInfo(ctx, "dispatching request to ", ob.Target)
 	if err := writeFirstPayload(s.input, writer); err != nil {
@@ -291,10 +303,9 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 
 func (m *ClientWorker) IsClosing() bool {
 	sm := m.sessionManager
-	if m.strategy.MaxConnection > 0 && sm.Count() >= int(m.strategy.MaxConnection) {
-		return true
-	}
-	return false
+	sm.RLock()
+	defer sm.RUnlock()
+	return sm.idSpaceExhausted() || (m.strategy.MaxConnection > 0 && uint32(sm.count) >= m.strategy.MaxConnection)
 }
 
 // IsFull returns true if this ClientWorker is unable to accept more connections.
@@ -317,14 +328,30 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 	}
 
 	sm := m.sessionManager
-	s := sm.Allocate(&m.strategy, link.Reader, link.Writer)
+	in := session.InboundFromContext(ctx)
+	tracked := in != nil && in.User != nil && in.User.Sessions != nil
+	s := sm.allocate(&m.strategy, link.Reader, link.Writer, tracked)
 	if s == nil {
 		return false
 	}
-	go fetchInput(ctx, s, m.link.Writer)
-	if _, ok := link.Reader.(*pipe.Reader); !ok {
+	if tracked {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		release, ok := in.User.Sessions.Track(cancel)
+		if !ok {
+			s.close(false, true)
+			return false
+		}
+		defer release()
+	}
+	go fetchInput(ctx, s, m.link.Writer.(*clientFrameWriter), tracked)
+	if _, ok := link.Reader.(*pipe.Reader); tracked || !ok {
 		select {
 		case <-ctx.Done():
+			if tracked {
+				s.close(false, true)
+			}
 		case <-s.done.Wait():
 		}
 	}

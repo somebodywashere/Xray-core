@@ -17,6 +17,7 @@ var cmdVersion = &base.Command{
 
 func executeVersion(cmd *base.Command, args []string) {
 	printVersion()
+	fmt.Println("Features: per-user-session-close")
 }
 
 func printVersion() {

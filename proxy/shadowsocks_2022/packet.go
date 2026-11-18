@@ -248,6 +248,8 @@ func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 }
 
 func (s *ServerUDPSession) DecryptAESPayload(method *CipherMethod, psk []byte, sessionID, packetID uint64, rawHeader, bodyCipher []byte) (DecodedUDPPacket, error) {
+	s.Lock()
+	defer s.Unlock()
 	bodyAead := s.clientBodyCipher
 	isNewCipher := false
 	if bodyAead == nil {
@@ -275,7 +277,12 @@ func (s *ServerUDPSession) DecryptAESPayload(method *CipherMethod, psk []byte, s
 		return DecodedUDPPacket{}, ErrBadHeaderType
 	}
 
-	s.AddPacketID(packetID)
+	if s.Window == nil {
+		s.Window = new(SlidingWindow)
+	}
+	if !s.Window.CheckAndAdd(packetID) {
+		return DecodedUDPPacket{}, ErrPacketIdNotUnique
+	}
 
 	if isNewCipher {
 		s.clientBodyCipher = bodyAead

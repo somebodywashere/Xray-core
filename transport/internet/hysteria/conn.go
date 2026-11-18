@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -95,7 +96,7 @@ type InterConn struct {
 	ch     chan []byte
 	time   time.Time
 	mutex  sync.Mutex
-	closed bool
+	closed atomic.Bool
 
 	write func(p []byte) error
 	close func()
@@ -129,7 +130,7 @@ func (c *InterConn) Read(p []byte) (int, error) {
 }
 
 func (c *InterConn) Write(p []byte) (int, error) {
-	if c.closed {
+	if c.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
 	binary.BigEndian.PutUint32(p, c.id)
@@ -179,8 +180,7 @@ type udpSessionManager struct {
 }
 
 func (m *udpSessionManager) close(udpConn *InterConn) {
-	if !udpConn.closed {
-		udpConn.closed = true
+	if !udpConn.closed.Swap(true) {
 		close(udpConn.ch)
 		delete(m.m, udpConn.id)
 	}
@@ -190,9 +190,11 @@ func (m *udpSessionManager) clean() {
 	ticker := time.NewTicker(idleCleanupInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		if m.closed {
+	for {
+		select {
+		case <-m.conn.Context().Done():
 			return
+		case <-ticker.C:
 		}
 
 		m.RLock()

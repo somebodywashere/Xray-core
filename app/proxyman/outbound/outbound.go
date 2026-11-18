@@ -135,14 +135,27 @@ func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
 	m.access.Lock()
 	defer m.access.Unlock()
 
+	m.removeHandler(tag)
+	return nil
+}
+
+// RemoveHandlerIf releases a dynamic reverse tag only while it still belongs
+// to the supplied handler. A concurrent replacement keeps its registration.
+func (m *Manager) RemoveHandlerIf(tag string, expected outbound.Handler) {
+	m.access.Lock()
+	defer m.access.Unlock()
+	if m.taggedHandler[tag] == expected {
+		m.removeHandler(tag)
+	}
+}
+
+func (m *Manager) removeHandler(tag string) {
 	m.tagsCache = &sync.Map{}
 
 	delete(m.taggedHandler, tag)
 	if m.defaultHandler != nil && m.defaultHandler.Tag() == tag {
 		m.defaultHandler = nil
 	}
-
-	return nil
 }
 
 // ListHandlers implements outbound.Manager.
@@ -163,12 +176,11 @@ func (m *Manager) ListHandlers(ctx context.Context) []outbound.Handler {
 // Select implements outbound.HandlerSelector.
 func (m *Manager) Select(selectors []string) []string {
 	key := strings.Join(selectors, ",")
+	m.access.RLock()
+	defer m.access.RUnlock()
 	if cache, ok := m.tagsCache.Load(key); ok {
 		return cache.([]string)
 	}
-
-	m.access.RLock()
-	defer m.access.RUnlock()
 
 	tags := make([]string, 0, len(selectors))
 

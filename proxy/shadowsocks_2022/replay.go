@@ -80,7 +80,6 @@ type ServerUDPSession struct {
 	SessionID  uint64
 	Window     *SlidingWindow
 	User       *protocol.MemoryUser
-	UserPSK    []byte
 	LastActive atomic.Int64 // Unix timestamp in seconds
 
 	clientBodyCipher cipher.AEAD
@@ -93,7 +92,7 @@ type ServerUDPSession struct {
 
 	manager     *UDPSessionManager
 	link        atomic.Pointer[transport.Link]
-	timer       *signal.ActivityTimer
+	timer       atomic.Pointer[signal.ActivityTimer]
 	currentConn atomic.Value // stores stat.Connection
 }
 
@@ -116,6 +115,7 @@ func (s *ServerUDPSession) AddPacketID(packetID uint64) {
 }
 
 type UDPSessionManager struct {
+	owner     *protocol.MemoryUser
 	sessions  *utils.TypedSyncMap[uint64, *ServerUDPSession]
 	timeout   time.Duration
 	lastClean atomic.Int64 // Unix timestamp in seconds
@@ -136,6 +136,7 @@ func (m *UDPSessionManager) GetOrCreate(sessionID uint64) *ServerUDPSession {
 	}
 
 	s := &ServerUDPSession{
+		User:      m.owner,
 		SessionID: sessionID,
 		manager:   m,
 	}
@@ -163,8 +164,9 @@ func (m *UDPSessionManager) cleanup(now int64) {
 	}
 	m.sessions.Range(func(k uint64, v *ServerUDPSession) bool {
 		if now-v.LastActive.Load() > timeoutSec {
-			m.sessions.Delete(k)
-			v.Close()
+			if m.sessions.CompareAndDelete(k, v) {
+				v.Close()
+			}
 		}
 		return true
 	})

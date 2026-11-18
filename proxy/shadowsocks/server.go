@@ -37,7 +37,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 			return nil, errors.New("failed to get shadowsocks user").Base(err)
 		}
 
-		if err := validator.Add(u); err != nil {
+		if err := validator.Add(u.NewGeneration()); err != nil {
 			return nil, errors.New("failed to add user").Base(err)
 		}
 	}
@@ -55,7 +55,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 
 // AddUser implements proxy.UserManager.AddUser().
 func (s *Server) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
-	return s.validator.Add(u)
+	return s.validator.Add(u.NewGeneration())
 }
 
 // RemoveUser implements proxy.UserManager.RemoveUser().
@@ -139,7 +139,7 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 			break
 		}
 
-		for _, payload := range mpayload {
+		for index, payload := range mpayload {
 			var request *protocol.RequestHeader
 			var data *buf.Buffer
 			var err error
@@ -151,6 +151,14 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 			} else {
 				request, data, err = DecodeUDPPacket(s.validator, payload)
 				if err == nil {
+					var finish func()
+					ctx, finish, err = request.User.TrackConnection(ctx, conn)
+					if err != nil {
+						data.Release()
+						buf.ReleaseMulti(mpayload[index+1:])
+						return err
+					}
+					defer finish()
 					inbound.User = request.User
 				}
 			}
@@ -221,6 +229,11 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 		panic("no inbound metadata")
 	}
 	inbound.User = request.User
+	ctx, finish, err := request.User.TrackConnection(ctx, conn)
+	if err != nil {
+		return err
+	}
+	defer finish()
 
 	dest := request.Destination()
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
@@ -235,6 +248,7 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 	sessionPolicy = s.policyManager.ForLevel(request.User.Level)
 	ctx, cancel := context.WithCancel(ctx)
 	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
+	defer timer.SetTimeout(0)
 
 	ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
 	link, err := dispatcher.Dispatch(ctx, dest)

@@ -11,7 +11,8 @@ import (
 
 // MemoryAccount is an account type converted from Account.
 type MemoryAccount struct {
-	Key []byte
+	Key         []byte
+	udpSessions *UDPSessionManager
 }
 
 // AsAccount implements protocol.AsAccount.
