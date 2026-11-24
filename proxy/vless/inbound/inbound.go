@@ -334,14 +334,21 @@ func (*Handler) Network() []net.Network {
 func (h *Handler) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatch routing.Dispatcher) error {
 	iConn := stat.TryUnwrapStatsConn(connection)
 
+	sessionPolicy := h.policyManager.ForLevel(0)
 	if h.decryption != nil {
+		// Encryption (and a lazy transport header) does I/O before VLESS reads the request.
+		if err := connection.SetDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
+			return errors.New("unable to set encryption handshake deadline").Base(err)
+		}
 		var err error
 		if connection, err = h.decryption.Handshake(connection, nil); err != nil {
 			return errors.New("ML-KEM-768 handshake failed").Base(err)
 		}
+		if err := connection.SetWriteDeadline(time.Time{}); err != nil {
+			return errors.New("unable to clear encryption handshake write deadline").Base(err)
+		}
 	}
 
-	sessionPolicy := h.policyManager.ForLevel(0)
 	if err := connection.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
 		return errors.New("unable to set read deadline").Base(err)
 	}
